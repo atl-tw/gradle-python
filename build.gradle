@@ -1,0 +1,162 @@
+import java.net.URI
+import static org.apache.tools.ant.taskdefs.condition.Os.*
+
+buildscript {
+    repositories {
+        jcenter()
+    }
+    dependencies {
+        classpath 'ru.vyarus:gradle-use-python-plugin:1.2.0'
+    }
+}
+
+apply plugin: 'ru.vyarus.use-python'
+
+project.ext {
+ projectGroup = 'myprojects'
+ projectType = 'lambda'
+ projectName = 'python-gradle'
+ publishBucket = 'mybucket'
+ artifactBucketPath="s3://${publishBucket}/${projectGroup}/${projectType}/${project.ext.projectName}"
+ sourceMain = file('./src/main/python')
+ sourceTest = file('./src/test/python')
+ build = './build'
+ buildDeployment = file('./build/deployment')
+ buildNumber = System.getenv("BUILD_NUMBER") == null ? 'LOCAL' : System.getenv("BUILD_NUMBER")
+ scriptPath = isFamily(FAMILY_WINDOWS) ? ".gradle/python/Scripts" : ".gradle/python/bin"
+ libPath = isFamily(FAMILY_WINDOWS) ? ".gradle/python/Lib/site-packages" : ".gradle/python/lib/python3.4/site-packages"
+}
+
+python {
+    pip 'awscli:1.16.60'
+    pip 'attrs:17.4.0'
+    pip 'boto3:1.9.50'
+    pip 'botocore:1.12.50'
+
+    pip 'pytest:3.4.2'
+    pip 'coverage:4.5.3'
+    pip 'pylint:2.3.1'
+    pip 'dependency-check:0.2.0'
+}
+
+task lint(type: PythonTask){
+    dependsOn 'test'
+    workDir = project.ext.sourceMain
+    command = "-m pylint core"
+}
+
+task test(type: PythonTask) {
+    workDir = project.ext.sourceMain
+    command = "-m coverage run -m pytest "+sourceTest.absolutePath
+}
+
+task coverage(type: PythonTask){
+    dependsOn 'test'
+    workDir = project.ext.sourceMain
+    command = "-m coverage report"
+}
+
+task coverageReport(type: PythonTask){
+    dependsOn 'test'
+    workDir = project.ext.sourceMain
+    command = "-m coverage html"
+    doLast {
+      mkdir "${project.ext.build}/reports"
+      def coverageDir = file("${project.ext.build}/reports/coverage")
+      if(coverageDir.exists()) project.delete(coverageDir)
+      System.out.println("moving ${project.ext.sourceMain}/htmlcov to ${coverageDir}")
+      file("${project.ext.sourceMain}/htmlcov").renameTo(coverageDir)
+    }
+}
+
+task packageLibs(type:Copy){
+  from (project.ext.libPath){
+    exclude 'awscli', 'setuptools', 'pip', 'wheel',
+        'pylint', '_pytest', 'coverage', 'dependency-check.py',
+         '*.dist-info', 'boto3', 'botocore', 'django'
+
+  }
+  into project.ext.buildDeployment
+}
+
+task packageSrc(type:Copy){
+  from project.ext.sourceMain
+  into project.ext.buildDeployment
+}
+
+task dependencyCheck {
+  doLast {
+    String proxyParams = ""
+    if(System.getenv("https_proxy") != null) {
+      URI uri = new URI(System.getenv("https_proxy"))
+      proxyParams+= " --proxyserver "+uri.getHost()+"  --proxyport "+uri.getPort()
+      String userpass = uri.getUserInfo();
+      if(userpass != null && !userpass.isEmpty()) {
+        proxyParams+=" --proxyuser " +userpass.substring(0, userpass.indexOf(':')) + " --proxypass "+userpass.substring(userpass.indexOf(':') + 1)
+      }
+    }
+    mkdir "build/reports/dependency-check"
+    def command = "--project test -s ${project.ext.libPath} --out  ${project.ext.build}/reports/dependency-check/report.html "+
+      " --enableExperimental${proxyParams}"
+    exec {
+      executable "${project.ext.scriptPath}/dependency-check"
+      args command.split(' ')
+    }
+  }
+}
+
+task packageZip(type:Zip) {
+    dependsOn "packageLibs"
+    dependsOn "packageSrc"
+    archiveFileName = "${project.ext.projectName}-${project.ext.buildNumber}.zip"
+    destinationDirectory = file(project.ext.build)
+    from project.ext.buildDeployment
+}
+
+task hashZip(type:Exec) {
+    dependsOn "packageZip"
+    def output = new ByteArrayOutputStream()
+    doFirst {
+        standardOutput = output
+    }
+    commandLine 'sha256sum', "${project.ext.build}/${project.ext.projectName}-${project.ext.buildNumber}.zip"
+    doLast {
+        String hash = new String(output.toByteArray());
+        hash = hash.substring(0, hash.indexOf(' '))
+        file("${project.ext.build}/${project.ext.projectName}-${project.ext.buildNumber}.sha").write(hash)
+    }
+}
+
+task build(type:Task) {
+   dependsOn "lint"
+   dependsOn "coverage"
+   dependsOn "coverageReport"
+   dependsOn "dependencyCheck"
+   dependsOn "packageZip"
+
+}
+
+task publishZip(type:PythonTask) {
+    command "${project.ext.scriptPath}/aws s3 cp  ${project.ext.build}/${project.ext.projectName}-"+
+        "${project.ext.buildNumber}.zip ${project.ext.artifactBucketPath}/${project.ext.projectName}-${project.ext.buildNumber}.zip"
+}
+
+task publishHash(type:PythonTask) {
+    dependsOn "hashZip"
+    command "${project.ext.scriptPath}/aws s3 cp ${project.ext.build}/${project.ext.projectName}-"+
+        "${project.ext.buildNumber}.sha ${project.ext.artifactBucketPath}/${project.ext.projectName}-${project.ext.buildNumber}.sha"
+}
+
+task publish {
+    dependsOn "publishZip"
+    dependsOn "publishHash"
+}
+
+task clean(type: Delete) {
+    delete project.ext.build
+}
+
+task superClean(type: Delete) {
+    dependsOn "clean"
+    delete '.gradle'
+}
